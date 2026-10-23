@@ -1,0 +1,28 @@
+# Build artifacts
+*.o
+*.exe
+*.so
+*.a
+*.dll
+
+# Controller binary
+controller/s0p0wn3d_controller
+
+# Implant binary
+implant/s0p0wn3d_implant.exe
+
+# OpenSSL keys
+*.pem
+*.key
+keys/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
