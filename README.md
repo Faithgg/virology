@@ -48,6 +48,8 @@ sudo apt install gcc-mingw-w64-x86-64
 # OpenSSL pour MinGW : voir https://wiki.openssl.org/index.php/Compilation_and_Installation
 ```
 
+
+
 ### Compilation
 
 ```bash
