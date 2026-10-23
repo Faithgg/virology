@@ -10,14 +10,14 @@ tâches et reçoit les résultats.
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│              CONTRÔLEUR (attaquant, Linux, C)           │
+│              CONTRÔLEUR (attaquant, Linux, C)             │
 │  ┌──────────┐  ┌───────────┐  ┌──────────┐  ┌─────────┐ │
 │  │ HTTP     │  │  Sessions │  │ TaskQueue│  │  Crypto │ │
 │  │ Server   │  │  Manager  │  │  (FIFO)  │  │ OpenSSL │ │
 │  │ (POSIX)  │  │           │  │          │  │ RSA+AES │ │
 │  └────┬─────┘  └─────┬─────┘  └────┬─────┘  └────┬────┘ │
-│       └──────────────┴─────────────┴──────────────┘     │
-│                         HTTP(S)                         │
+│       └──────────────┴─────────────┴──────────────┘       │
+│                         HTTP(S)                            │
 └────────────────────────────┬────────────────────────────┘
                              │
                     ┌────────▼────────┐
@@ -26,30 +26,38 @@ tâches et reçoit les résultats.
                     └────────┬────────┘
                              │
 ┌────────────────────────────▼────────────────────────────┐
-│              IMPLANT (cible, Windows, C)                │
+│              IMPLANT (cible, Windows, C)                   │
 │  ┌──────────┐  ┌───────────┐  ┌──────────┐  ┌─────────┐ │
 │  │ Beacon   │  │ Transport │  │  Crypto  │  │ Task    │ │
 │  │ Loop     │→ │ (WinHTTP) │→ │ OpenSSL  │→ │ Runner  │ │
 │  └──────────┘  └───────────┘  └──────────┘  └────┬────┘ │
-│                                                  │      │
-│              ┌───────────────────────────────────┘      │
-│              ▼                                          │
-│  ┌──────────────────────────────────────────┐           │
-│  │           MODULES (extensibles)          │           │
-│  │  shell │ keylog │ creds │ persistence│   │           │
-│  │  loot  │ privesc│ pth   │ propagate  │   │           │
-│  └──────────────────────────────────────────┘           │
-└─────────────────────────────────────────────────────────┘
+│                                                  │       │
+│              ┌───────────────────────────────────┘       │
+│              ▼                                            │
+│  ┌──────────────────────────────────────────┐            │
+│  │           MODULES (extensibles)           │            │
+│  │  shell │ keylog │ creds │ persistence │   │            │
+│  │  loot  │ privesc│ pth   │ propagate  │   │            │
+│  └──────────────────────────────────────────┘            │
+└──────────────────────────────────────────────────────────┘
 ```
 
 ## Choix techniques
 
-| Composant       | Langage | Bibliothèques                  | Plateforme    |
-|----------------|---------|-------------------------------|-----------------|
-| Contrôleur     | C (C11) | POSIX sockets, pthreads, OpenSSL, cJSON | Linux |
-| Implant        | C (C11) | WinHTTP, OpenSSL, Win32 API    | Windows        |
-| Transport      | C       | HTTP via WinHTTP / POSIX       | Tunnel HTTP    |
-| Chiffrement    | C       | OpenSSL EVP (RSA-4096, AES-256-GCM) | Hybride   |
+| Composant       | Langage | Bibliothèques                  | Plateforme  |
+|----------------|---------|-------------------------------|-------------|
+| Contrôleur     | C (C11) | POSIX sockets, pthreads, OpenSSL, cJSON | Linux       |
+| Implant        | C (C11) | WinHTTP, OpenSSL, Win32 API    | Windows     |
+| Transport      | C       | HTTP via WinHTTP / POSIX       | Tunnel HTTP |
+| Chiffrement    | C       | OpenSSL EVP (RSA-4096, AES-256-GCM) | Hybride  |
+
+### Pourquoi le C
+
+- Compilation native → binaire autonome, faible empreinte mémoire
+- Accès direct aux API système Windows (Win32, syscalls)
+- Pas de runtime interprété (contrairement à Python) → plus difficile à détecter
+- Contrôle fin de la mémoire et des processus
+- Aligné avec les exigences du projet (syscall direct, AV evasion)
 
 ### Pourquoi HTTP comme tunnel v1
 
@@ -69,15 +77,15 @@ tâches et reçoit les résultats.
 
 ### Endpoints du contrôleur
 
-| Méthode | Route                  | Description                                  |
-|---------|------------------------|----------------------------------------------|
-| GET     | `/pubkey`              | Récupère la clé publique RSA du contrôleur.  |
-| POST    | `/register`            | Enregistre un nouvel implant (session)       |
-| GET     | `/tasks/{session_id}`  | Récupère les tâches en attente               |
-| POST    | `/results/{session_id}`| Soumet le résultat d'une tâche               |
-| GET     | `/sessions`            | Liste des sessions (admin)                   |
-| POST    | `/sessions/{id}/task`  | Assigner une tâche (admin)                   |
-| GET     | `/sessions/{id}/results` | Récupérer les résultats (admin)            |
+| Méthode | Route                  | Description                              |
+|---------|------------------------|------------------------------------------|
+| GET     | `/pubkey`              | Récupère la clé publique RSA du contrôleur|
+| POST    | `/register`            | Enregistre un nouvel implant (session)   |
+| GET     | `/tasks/{session_id}`  | Récupère les tâches en attente            |
+| POST    | `/results/{session_id}`| Soumet le résultat d'une tâche            |
+| GET     | `/sessions`            | Liste des sessions (admin)               |
+| POST    | `/sessions/{id}/task`  | Assigner une tâche (admin)               |
+| GET     | `/sessions/{id}/results` | Récupérer les résultats (admin)       |
 
 ### Cycle de vie de l'implant
 
@@ -161,6 +169,8 @@ s0p0wn3d/
 │   ├── protocol.h        # Constantes, structures, types
 │   ├── json.h/.c         # Helpers JSON minimaux
 │   └── base64.h/.c       # Encodage/décodage Base64
+├── prototype/             # Prototype Python (Phase 1 — référence)
+│   └── python/
 ├── docs/                  # Documentation
 │   ├── architecture.md
 │   ├── mitre_mapping.md
@@ -170,3 +180,29 @@ s0p0wn3d/
 ├── README.md
 └── .gitignore
 ```
+
+## Plan de développement itératif
+
+| Phase | Objectif                              | Modules                |
+|-------|---------------------------------------|------------------------|
+| 1     | Plan de contrôle (beacon + crypto)    | ping, hostname, whoami, sysinfo |
+| 2     | Shell restreint                       | shell (built-in, pas de spawn) |
+| 3     | Persistance (simulé d'abord)          | persistence (scheduled task) |
+| 4     | Extraction d'identifiants             | creds (LSASS/SAM — lab only) |
+| 5     | Modules étendus                       | keylog, loot, propagate, etc. |
+| 6     | Durcissement / furtivité              | AV evasion, syscall, log rollback |
+
+## Lab environment
+
+- **Cible** : Windows 10/11 VM (VirtualBox ou VMware)
+- **Contrôleur** : Linux (Kali ou Ubuntu) sur le même réseau virtuel (host-only)
+- **Wireshark** : capture sur l'interface du contrôleur pour preuve de chiffrement
+- **Snapshot** : VM cible snapshotée avant chaque test
+- Voir `docs/lab_manifest.md` pour le manifest reproductible
+
+## Considérations de sécurité et cadre légal
+
+Ce projet est strictement pédagogique. L'outil ne doit être déployé que
+sur des machines de laboratoire contrôlées. Toute utilisation contre un
+système sans consentement écrit explicite est illégale et strictement
+interdite.

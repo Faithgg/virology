@@ -1,34 +1,32 @@
-/*
- * s0P0wn3d — Implémentation de l'exécuteur de tâches.
- */
-
 #include "task_runner.h"
 #include "modules.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
-void task_runner_execute(const task_t *task, task_result_t *result) {
+int task_runner_execute(const task_t *task, task_result_t *result) {
+    if (!task || !result) return -1;
+
     memset(result, 0, sizeof(task_result_t));
+    snprintf(result->task_id, sizeof(result->task_id), "%s", task->task_id);
 
-    /* Copier le task_id */
-    strncpy(result->task_id, task->task_id, S0P_MAX_TASK_ID - 1);
-
-    /* Trouver le module */
     const module_def_t *mod = modules_find(task->command);
     if (!mod) {
-        strncpy(result->status, "error", sizeof(result->status) - 1);
-        snprintf(result->output, S0P_MAX_OUTPUT,
-                 "unknown command: %s", task->command);
-        return;
+        strcpy(result->status, "error");
+        snprintf(result->output, sizeof(result->output),
+                "Unknown command: %s", task->command);
+        return -1;
     }
 
-    /* Exécuter le module */
     char *output = mod->execute(task->args);
-    strncpy(result->status, "success", sizeof(result->status) - 1);
-
     if (output) {
-        strncpy(result->output, output, S0P_MAX_OUTPUT - 1);
-        result->output[S0P_MAX_OUTPUT - 1] = '\0';
+        strcpy(result->status, "success");
+        strncpy(result->output, output, sizeof(result->output) - 1);
         free(output);
+    } else {
+        strcpy(result->status, "error");
+        strcpy(result->output, "Execution failed");
     }
+
+    return 0;
 }

@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <lmcons.h>
 
 /* ─── ping ─────────────────────────────────────────────────────────────────── */
@@ -16,6 +17,18 @@
 static char *mod_ping(const char *args) {
     (void)args;
     return _strdup("pong");
+}
+
+/* ─── check (heartbeat/connectivity check) ─────────────────────────────────── */
+
+static char *mod_check(const char *args) {
+    (void)args;
+    char *response = malloc(256);
+    if (response) {
+        time_t now = time(NULL);
+        snprintf(response, 256, "{\"status\":\"online\",\"timestamp\":%lld}", (long long)now);
+    }
+    return response ? response : _strdup("{\"status\":\"online\"}");
 }
 
 /* ─── hostname ─────────────────────────────────────────────────────────────── */
@@ -201,6 +214,13 @@ static const module_def_t modules[] = {
         .mitre_id = "T1010",
         .blue_team_note = "Beacon régulier détectable par analyse de fréquence",
         .execute = mod_ping
+    },
+    {
+        .name = "check",
+        .description = "Heartbeat - confirme la présence de l'implant",
+        .mitre_id = "T1010",
+        .blue_team_note = "Requête régulière de connectivity check - détectable par pattern de timing",
+        .execute = mod_check
     },
     {
         .name = "hostname",
